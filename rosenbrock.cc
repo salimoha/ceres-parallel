@@ -26,10 +26,13 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 //
-// Author: sameeragarwal@google.com (Sameer Agarwal)  
+// Author: sameeragarwal@google.com (Sameer Agarwal)
 
 #include "ceres/ceres.h"
+#include "float.h"
 #include "glog/logging.h"
+
+typedef double(*FunctionSolver)(double*);
 
 // f(x,y) = (1-x)^2 + 100(y - x^2)^2;
 class Rosenbrock : public ceres::FirstOrderFunction {
@@ -52,23 +55,66 @@ class Rosenbrock : public ceres::FirstOrderFunction {
 
   virtual int NumParameters() const { return 2; }
 };
+omp_lock_t lock;
+omp_lock_t lock_for_min_cost;
+double rosenbrockSolver(double parameters[])
+{
+	double initialParameters[2] = { parameters[0],parameters[1] };
+	ceres::GradientProblemSolver::Options options;
+	options.minimizer_progress_to_stdout = false;
 
+	ceres::GradientProblemSolver::Summary summary;
+	ceres::GradientProblem problem(new Rosenbrock());
+	ceres::Solve(options, problem, parameters, &summary);
+	
+	omp_set_lock(&lock);
+	std::cout << summary.FullReport() << "\n";
+	std::cout << "Initial x: " << initialParameters[0] << " y: " << initialParameters[1] << "\n";
+	std::cout << "Final   x: " << parameters[0]
+		<< " y: " << parameters[1] << "\n";
+	omp_unset_lock(&lock);
 
+	return summary.final_cost;
+}
+void minimizeFunction(FunctionSolver function, const int samples, double bestResult[])
+{
+	const double scale = 3.0;
+	const double offset = 1.0;
+	//std::vector<std::vector<double>> results(samples);
+	double cost=DBL_MAX;
+	srand(time(NULL));
+	omp_init_lock(&lock);
+	omp_init_lock(&lock_for_min_cost);
+    #pragma omp parallel num_threads(samples)  
+	{
+		int i = omp_get_thread_num();
+		double parameters[2];
+		parameters[0] = (double)rand() / RAND_MAX; //value between 0 and 1;
+		parameters[0] = parameters[0] * scale - offset;
+		parameters[1] = (double)rand() / RAND_MAX; //value between 0 and 1;
+		parameters[1] = parameters[1] * scale - offset;
+		double costResult=function(parameters);
+		omp_set_lock(&lock_for_min_cost);
+		if (cost > costResult)
+		{
+			bestResult[0] = parameters[0];
+			bestResult[1] = parameters[1];
+			cost = costResult;
+		}
+		omp_unset_lock(&lock_for_min_cost);
+	}
+	omp_destroy_lock(&lock);	
+	omp_destroy_lock(&lock_for_min_cost);
+}
 int main(int argc, char** argv) {
+  int samples=5;
+  if(argc==2)
+	samples=atoi(argv[1]);
   google::InitGoogleLogging(argv[0]);
 
-  double parameters[2] = {-11.0, 10.0};
-
-  ceres::GradientProblemSolver::Options options;
-  options.minimizer_progress_to_stdout = true;
-
-  ceres::GradientProblemSolver::Summary summary;
-  ceres::GradientProblem problem(new Rosenbrock());
-  ceres::Solve(options, problem, parameters, &summary);
-
-  std::cout << summary.FullReport() << "\n";
-  std::cout << "Initial x: " << -1.2 << " y: " << 1.0 << "\n";
-  std::cout << "Final   x: " << parameters[0]
-            << " y: " << parameters[1] << "\n";
+  double result[2];
+  minimizeFunction(rosenbrockSolver, samples, result);
+  std::cout << "best result is x:" << result[0] << " y:" << result[1] <<  std::endl;
   return 0;
 }
+

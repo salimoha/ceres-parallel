@@ -26,162 +26,318 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 //
-// Author: keir@google.com (Keir Mierle)
+// Author: sameeragarwal@google.com (Sameer Agarwal)
 //
-// A minimal, self-contained bundle adjuster using Ceres, that reads
-// files from University of Washington' Bundle Adjustment in the Large dataset:
+// An example of solving a dynamically sized problem with various
+// solvers and loss functions.
+//
+// For a simpler bare bones example of doing bundle adjustment with
+// Ceres, please see simple_bundle_adjuster.cc.
+//
+// NOTE: This example will not compile without gflags and SuiteSparse.
+//
+// The problem being solved here is known as a Bundle Adjustment
+// problem in computer vision. Given a set of 3d points X_1, ..., X_n,
+// a set of cameras P_1, ..., P_m. If the point X_i is visible in
+// image j, then there is a 2D observation u_ij that is the expected
+// projection of X_i using P_j. The aim of this optimization is to
+// find values of X_i and P_j such that the reprojection error
+//
+//    E(X,P) =  sum_ij  |u_ij - P_j X_i|^2
+//
+// is minimized.
+//
+// The problem used here comes from a collection of bundle adjustment
+// problems published at University of Washington.
 // http://grail.cs.washington.edu/projects/bal
-//
-// This does not use the best configuration for solving; see the more involved
-// bundle_adjuster.cc file for details.
+
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <iostream>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "bal_problem.h"
 #include "ceres/ceres.h"
-#include "ceres/rotation.h"
-// Read a Bundle Adjustment in the Large dataset.
-class BALProblem {
- public:
-  ~BALProblem() {
-    delete[] point_index_;
-    delete[] camera_index_;
-    delete[] observations_;
-    delete[] parameters_;
-  }
-  int num_observations()       const { return num_observations_;               }
-  const double* observations() const { return observations_;                   }
-  double* mutable_cameras()          { return parameters_;                     }
-  double* mutable_points()           { return parameters_  + 9 * num_cameras_; }
-  double* mutable_camera_for_observation(int i) {
-    return mutable_cameras() + camera_index_[i] * 9;
-  }
-  double* mutable_point_for_observation(int i) {
-    return mutable_points() + point_index_[i] * 3;
-  }
-  bool LoadFile(const char* filename) {
-    FILE* fptr = fopen(filename, "r");
-    if (fptr == NULL) {
-      return false;
-    };
-    FscanfOrDie(fptr, "%d", &num_cameras_);
-    FscanfOrDie(fptr, "%d", &num_points_);
-    FscanfOrDie(fptr, "%d", &num_observations_);
-    point_index_ = new int[num_observations_];
-    camera_index_ = new int[num_observations_];
-    observations_ = new double[2 * num_observations_];
-    num_parameters_ = 9 * num_cameras_ + 3 * num_points_;
-    parameters_ = new double[num_parameters_];
-    for (int i = 0; i < num_observations_; ++i) {
-      FscanfOrDie(fptr, "%d", camera_index_ + i);
-      FscanfOrDie(fptr, "%d", point_index_ + i);
-      for (int j = 0; j < 2; ++j) {
-        FscanfOrDie(fptr, "%lf", observations_ + 2*i + j);
+#include "gflags/gflags.h"
+#include "glog/logging.h"
+#include "snavely_reprojection_error.h"
+
+DEFINE_string(input, "", "Input File name");
+DEFINE_string(trust_region_strategy, "levenberg_marquardt",
+              "Options are: levenberg_marquardt, dogleg.");
+DEFINE_string(dogleg, "traditional_dogleg", "Options are: traditional_dogleg,"
+              "subspace_dogleg.");
+
+DEFINE_bool(inner_iterations, false, "Use inner iterations to non-linearly "
+            "refine each successful trust region step.");
+
+DEFINE_string(blocks_for_inner_iterations, "automatic", "Options are: "
+            "automatic, cameras, points, cameras,points, points,cameras");
+
+DEFINE_string(linear_solver, "sparse_schur", "Options are: "
+              "sparse_schur, dense_schur, iterative_schur, sparse_normal_cholesky, "
+              "dense_qr, dense_normal_cholesky and cgnr.");
+DEFINE_bool(explicit_schur_complement, false, "If using ITERATIVE_SCHUR "
+            "then explicitly compute the Schur complement.");
+DEFINE_string(preconditioner, "jacobi", "Options are: "
+              "identity, jacobi, schur_jacobi, cluster_jacobi, "
+              "cluster_tridiagonal.");
+DEFINE_string(visibility_clustering, "canonical_views",
+              "single_linkage, canonical_views");
+
+DEFINE_string(sparse_linear_algebra_library, "suite_sparse",
+              "Options are: suite_sparse and cx_sparse.");
+DEFINE_string(dense_linear_algebra_library, "eigen",
+              "Options are: eigen and lapack.");
+DEFINE_string(ordering, "automatic", "Options are: automatic, user.");
+
+DEFINE_bool(use_quaternions, false, "If true, uses quaternions to represent "
+            "rotations. If false, angle axis is used.");
+DEFINE_bool(use_local_parameterization, false, "For quaternions, use a local "
+            "parameterization.");
+DEFINE_bool(robustify, false, "Use a robust loss function.");
+
+DEFINE_double(eta, 1e-2, "Default value for eta. Eta determines the "
+             "accuracy of each linear solve of the truncated newton step. "
+             "Changing this parameter can affect solve performance.");
+
+DEFINE_int32(num_threads, 1, "Number of threads.");
+DEFINE_int32(num_iterations, 50, "Number of iterations.");
+DEFINE_double(max_solver_time, 1e32, "Maximum solve time in seconds.");
+DEFINE_bool(nonmonotonic_steps, false, "Trust region algorithm can use"
+            " nonmonotic steps.");
+
+DEFINE_double(rotation_sigma, 0.0, "Standard deviation of camera rotation "
+              "perturbation.");
+DEFINE_double(translation_sigma, 0.0, "Standard deviation of the camera "
+              "translation perturbation.");
+DEFINE_double(point_sigma, 0.0, "Standard deviation of the point "
+              "perturbation.");
+DEFINE_int32(random_seed, 38401, "Random seed used to set the state "
+             "of the pseudo random number generator used to generate "
+             "the pertubations.");
+DEFINE_bool(line_search, false, "Use a line search instead of trust region "
+            "algorithm.");
+DEFINE_string(initial_ply, "", "Export the BAL file data as a PLY file.");
+DEFINE_string(final_ply, "", "Export the refined BAL file data as a PLY "
+              "file.");
+
+namespace ceres {
+namespace examples {
+
+void SetLinearSolver(Solver::Options* options) {
+  CHECK(StringToLinearSolverType(FLAGS_linear_solver,
+                                 &options->linear_solver_type));
+  CHECK(StringToPreconditionerType(FLAGS_preconditioner,
+                                   &options->preconditioner_type));
+  CHECK(StringToVisibilityClusteringType(FLAGS_visibility_clustering,
+                                         &options->visibility_clustering_type));
+  CHECK(StringToSparseLinearAlgebraLibraryType(
+            FLAGS_sparse_linear_algebra_library,
+            &options->sparse_linear_algebra_library_type));
+  CHECK(StringToDenseLinearAlgebraLibraryType(
+            FLAGS_dense_linear_algebra_library,
+            &options->dense_linear_algebra_library_type));
+  options->num_linear_solver_threads = FLAGS_num_threads;
+  options->use_explicit_schur_complement = FLAGS_explicit_schur_complement;
+}
+
+void SetOrdering(BALProblem* bal_problem, Solver::Options* options) {
+  const int num_points = bal_problem->num_points();
+  const int point_block_size = bal_problem->point_block_size();
+  double* points = bal_problem->mutable_points();
+
+  const int num_cameras = bal_problem->num_cameras();
+  const int camera_block_size = bal_problem->camera_block_size();
+  double* cameras = bal_problem->mutable_cameras();
+
+  if (options->use_inner_iterations) {
+    if (FLAGS_blocks_for_inner_iterations == "cameras") {
+      LOG(INFO) << "Camera blocks for inner iterations";
+      options->inner_iteration_ordering.reset(new ParameterBlockOrdering);
+      for (int i = 0; i < num_cameras; ++i) {
+        options->inner_iteration_ordering->AddElementToGroup(cameras + camera_block_size * i, 0);
       }
+    } else if (FLAGS_blocks_for_inner_iterations == "points") {
+      LOG(INFO) << "Point blocks for inner iterations";
+      options->inner_iteration_ordering.reset(new ParameterBlockOrdering);
+      for (int i = 0; i < num_points; ++i) {
+        options->inner_iteration_ordering->AddElementToGroup(points + point_block_size * i, 0);
+      }
+    } else if (FLAGS_blocks_for_inner_iterations == "cameras,points") {
+      LOG(INFO) << "Camera followed by point blocks for inner iterations";
+      options->inner_iteration_ordering.reset(new ParameterBlockOrdering);
+      for (int i = 0; i < num_cameras; ++i) {
+        options->inner_iteration_ordering->AddElementToGroup(cameras + camera_block_size * i, 0);
+      }
+      for (int i = 0; i < num_points; ++i) {
+        options->inner_iteration_ordering->AddElementToGroup(points + point_block_size * i, 1);
+      }
+    } else if (FLAGS_blocks_for_inner_iterations == "points,cameras") {
+      LOG(INFO) << "Point followed by camera blocks for inner iterations";
+      options->inner_iteration_ordering.reset(new ParameterBlockOrdering);
+      for (int i = 0; i < num_cameras; ++i) {
+        options->inner_iteration_ordering->AddElementToGroup(cameras + camera_block_size * i, 1);
+      }
+      for (int i = 0; i < num_points; ++i) {
+        options->inner_iteration_ordering->AddElementToGroup(points + point_block_size * i, 0);
+      }
+    } else if (FLAGS_blocks_for_inner_iterations == "automatic") {
+      LOG(INFO) << "Choosing automatic blocks for inner iterations";
+    } else {
+      LOG(FATAL) << "Unknown block type for inner iterations: "
+                 << FLAGS_blocks_for_inner_iterations;
     }
-    for (int i = 0; i < num_parameters_; ++i) {
-      FscanfOrDie(fptr, "%lf", parameters_ + i);
+  }
+
+  // Bundle adjustment problems have a sparsity structure that makes
+  // them amenable to more specialized and much more efficient
+  // solution strategies. The SPARSE_SCHUR, DENSE_SCHUR and
+  // ITERATIVE_SCHUR solvers make use of this specialized
+  // structure.
+  //
+  // This can either be done by specifying Options::ordering_type =
+  // ceres::SCHUR, in which case Ceres will automatically determine
+  // the right ParameterBlock ordering, or by manually specifying a
+  // suitable ordering vector and defining
+  // Options::num_eliminate_blocks.
+  if (FLAGS_ordering == "automatic") {
+    return;
+  }
+
+  ceres::ParameterBlockOrdering* ordering =
+      new ceres::ParameterBlockOrdering;
+
+  // The points come before the cameras.
+  for (int i = 0; i < num_points; ++i) {
+    ordering->AddElementToGroup(points + point_block_size * i, 0);
+  }
+
+  for (int i = 0; i < num_cameras; ++i) {
+    // When using axis-angle, there is a single parameter block for
+    // the entire camera.
+    ordering->AddElementToGroup(cameras + camera_block_size * i, 1);
+  }
+
+  options->linear_solver_ordering.reset(ordering);
+}
+
+void SetMinimizerOptions(Solver::Options* options) {
+  options->max_num_iterations = FLAGS_num_iterations;
+  options->minimizer_progress_to_stdout = true;
+  options->num_threads = FLAGS_num_threads;
+  options->eta = FLAGS_eta;
+  options->max_solver_time_in_seconds = FLAGS_max_solver_time;
+  options->use_nonmonotonic_steps = FLAGS_nonmonotonic_steps;
+  if (FLAGS_line_search) {
+    options->minimizer_type = ceres::LINE_SEARCH;
+  }
+
+  CHECK(StringToTrustRegionStrategyType(FLAGS_trust_region_strategy,
+                                        &options->trust_region_strategy_type));
+  CHECK(StringToDoglegType(FLAGS_dogleg, &options->dogleg_type));
+  options->use_inner_iterations = FLAGS_inner_iterations;
+}
+
+void SetSolverOptionsFromFlags(BALProblem* bal_problem,
+                               Solver::Options* options) {
+  SetMinimizerOptions(options);
+  SetLinearSolver(options);
+  SetOrdering(bal_problem, options);
+}
+
+void BuildProblem(BALProblem* bal_problem, Problem* problem) {
+  const int point_block_size = bal_problem->point_block_size();
+  const int camera_block_size = bal_problem->camera_block_size();
+  double* points = bal_problem->mutable_points();
+  double* cameras = bal_problem->mutable_cameras();
+
+  // Observations is 2*num_observations long array observations =
+  // [u_1, u_2, ... , u_n], where each u_i is two dimensional, the x
+  // and y positions of the observation.
+  const double* observations = bal_problem->observations();
+  for (int i = 0; i < bal_problem->num_observations(); ++i) {
+    CostFunction* cost_function;
+    // Each Residual block takes a point and a camera as input and
+    // outputs a 2 dimensional residual.
+    cost_function =
+        (FLAGS_use_quaternions)
+        ? SnavelyReprojectionErrorWithQuaternions::Create(
+            observations[2 * i + 0],
+            observations[2 * i + 1])
+        : SnavelyReprojectionError::Create(
+            observations[2 * i + 0],
+            observations[2 * i + 1]);
+
+    // If enabled use Huber's loss function.
+    LossFunction* loss_function = FLAGS_robustify ? new HuberLoss(1.0) : NULL;
+
+    // Each observation correponds to a pair of a camera and a point
+    // which are identified by camera_index()[i] and point_index()[i]
+    // respectively.
+    double* camera =
+        cameras + camera_block_size * bal_problem->camera_index()[i];
+    double* point = points + point_block_size * bal_problem->point_index()[i];
+    problem->AddResidualBlock(cost_function, loss_function, camera, point);
+  }
+
+  if (FLAGS_use_quaternions && FLAGS_use_local_parameterization) {
+    LocalParameterization* camera_parameterization =
+        new ProductParameterization(
+            new QuaternionParameterization(),
+            new IdentityParameterization(6));
+    for (int i = 0; i < bal_problem->num_cameras(); ++i) {
+      problem->SetParameterization(cameras + camera_block_size * i,
+                                   camera_parameterization);
     }
-    return true;
   }
- private:
-  template<typename T>
-  void FscanfOrDie(FILE *fptr, const char *format, T *value) {
-    int num_scanned = fscanf(fptr, format, value);
-    if (num_scanned != 1) {
-      LOG(FATAL) << "Invalid UW data file.";
-    }
+}
+
+void SolveProblem(const char* filename) {
+  BALProblem bal_problem(filename, FLAGS_use_quaternions);
+
+  if (!FLAGS_initial_ply.empty()) {
+    bal_problem.WriteToPLYFile(FLAGS_initial_ply);
   }
-  int num_cameras_;
-  int num_points_;
-  int num_observations_;
-  int num_parameters_;
-  int* point_index_;
-  int* camera_index_;
-  double* observations_;
-  double* parameters_;
-};
-// Templated pinhole camera model for used with Ceres.  The camera is
-// parameterized using 9 parameters: 3 for rotation, 3 for translation, 1 for
-// focal length and 2 for radial distortion. The principal point is not modeled
-// (i.e. it is assumed be located at the image center).
-struct SnavelyReprojectionError {
-  SnavelyReprojectionError(double observed_x, double observed_y)
-      : observed_x(observed_x), observed_y(observed_y) {}
-  template <typename T>
-  bool operator()(const T* const camera,
-                  const T* const point,
-                  T* residuals) const {
-    // camera[0,1,2] are the angle-axis rotation.
-    T p[3];
-    ceres::AngleAxisRotatePoint(camera, point, p);
-    // camera[3,4,5] are the translation.
-    p[0] += camera[3];
-    p[1] += camera[4];
-    p[2] += camera[5];
-    // Compute the center of distortion. The sign change comes from
-    // the camera model that Noah Snavely's Bundler assumes, whereby
-    // the camera coordinate system has a negative z axis.
-    T xp = - p[0] / p[2];
-    T yp = - p[1] / p[2];
-    // Apply second and fourth order radial distortion.
-    const T& l1 = camera[7];
-    const T& l2 = camera[8];
-    T r2 = xp*xp + yp*yp;
-    T distortion = 1.0 + r2  * (l1 + l2  * r2);
-    // Compute final projected point position.
-    const T& focal = camera[6];
-    T predicted_x = focal * distortion * xp;
-    T predicted_y = focal * distortion * yp;
-    // The error is the difference between the predicted and observed position.
-    residuals[0] = predicted_x - observed_x;
-    residuals[1] = predicted_y - observed_y;
-    return true;
-  }
-  // Factory to hide the construction of the CostFunction object from
-  // the client code.
-  static ceres::CostFunction* Create(const double observed_x,
-                                     const double observed_y) {
-    return (new ceres::AutoDiffCostFunction<SnavelyReprojectionError, 2, 9, 3>(
-                new SnavelyReprojectionError(observed_x, observed_y)));
-  }
-  double observed_x;
-  double observed_y;
-};
-int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
-  if (argc != 2) {
-    std::cerr << "usage: simple_bundle_adjuster <bal_problem>\n";
-    return 1;
-  }
-  BALProblem bal_problem;
-  if (!bal_problem.LoadFile(argv[1])) {
-    std::cerr << "ERROR: unable to open file " << argv[1] << "\n";
-    return 1;
-  }
-  const double* observations = bal_problem.observations();
-  // Create residuals for each observation in the bundle adjustment problem. The
-  // parameters for cameras and points are added automatically.
-  ceres::Problem problem;
-  for (int i = 0; i < bal_problem.num_observations(); ++i) {
-    // Each Residual block takes a point and a camera as input and outputs a 2
-    // dimensional residual. Internally, the cost function stores the observed
-    // image location and compares the reprojection against the observation.
-    ceres::CostFunction* cost_function =
-        SnavelyReprojectionError::Create(observations[2 * i + 0],
-                                         observations[2 * i + 1]);
-    problem.AddResidualBlock(cost_function,
-                             NULL /* squared loss */,
-                             bal_problem.mutable_camera_for_observation(i),
-                             bal_problem.mutable_point_for_observation(i));
-  }
-  // Make Ceres automatically detect the bundle structure. Note that the
-  // standard solver, SPARSE_NORMAL_CHOLESKY, also works fine but it is slower
-  // for standard bundle adjustment problems.
-  ceres::Solver::Options options;
-  options.linear_solver_type = ceres::DENSE_SCHUR;
-  options.minimizer_progress_to_stdout = true;
-  ceres::Solver::Summary summary;
-  ceres::Solve(options, &problem, &summary);
+
+  Problem problem;
+
+  srand(FLAGS_random_seed);
+  bal_problem.Normalize();
+  bal_problem.Perturb(FLAGS_rotation_sigma,
+                      FLAGS_translation_sigma,
+                      FLAGS_point_sigma);
+
+  BuildProblem(&bal_problem, &problem);
+  Solver::Options options;
+  SetSolverOptionsFromFlags(&bal_problem, &options);
+  options.gradient_tolerance = 1e-16;
+  options.function_tolerance = 1e-16;
+  Solver::Summary summary;
+  Solve(options, &problem, &summary);
   std::cout << summary.FullReport() << "\n";
+
+  if (!FLAGS_final_ply.empty()) {
+    bal_problem.WriteToPLYFile(FLAGS_final_ply);
+  }
+}
+
+}  // namespace examples
+}  // namespace ceres
+
+int main(int argc, char** argv) {
+  CERES_GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+  google::InitGoogleLogging(argv[0]);
+  if (FLAGS_input.empty()) {
+    LOG(ERROR) << "Usage: bundle_adjuster --input=bal_problem";
+    return 1;
+  }
+
+  CHECK(FLAGS_use_quaternions || !FLAGS_use_local_parameterization)
+      << "--use_local_parameterization can only be used with "
+      << "--use_quaternions.";
+  ceres::examples::SolveProblem(FLAGS_input.c_str());
   return 0;
 }
